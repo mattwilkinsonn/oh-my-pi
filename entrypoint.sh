@@ -17,17 +17,43 @@ elif [[ "${1:-}" == *"robomp.proxy"* ]]; then
     is_proxy_role=1
 fi
 
-if [ "$is_proxy_role" -eq 0 ]; then
-    : "${PI_ROOT:=/work/pi}"
-    if [ ! -d "$PI_ROOT/packages/coding-agent" ]; then
-        echo "robomp: PI_ROOT=$PI_ROOT does not look like a pi checkout (no packages/coding-agent/)" >&2
-        exit 1
-    fi
+/usr/sbin/groupadd -f -g 2000 omp
+
+if [ "$is_proxy_role" -eq 1 ]; then
+    exec "$@"
 fi
 
-mkdir -p /data/workspaces /data/logs
+: "${PI_ROOT:=/work/pi}"
+if [ ! -d "$PI_ROOT/packages/coding-agent" ]; then
+    echo "robomp: PI_ROOT=$PI_ROOT does not look like a pi checkout (no packages/coding-agent/)" >&2
+    exit 1
+fi
+
+max_slots="${ROBOMP_MAX_CONCURRENCY:-8}"
+for i in $(seq 1 "$max_slots"); do
+    user="omp-$i"
+    uid=$((2000 + i))
+    id -u "$user" >/dev/null 2>&1 || /usr/sbin/useradd -u "$uid" -g omp -M -N -s /usr/sbin/nologin "$user"
+done
+
+mkdir -p /data/workspaces /data/workspaces/_pool /data/logs
 # Persistent build caches under the /data volume. CARGO_HOME, CARGO_TARGET_DIR,
 # RUSTUP_HOME, and BUN_INSTALL_CACHE_DIR are pinned to these paths in the image
 # ENV so every per-issue worktree shares one cargo target and one bun cache.
 mkdir -p /data/cache/cargo /data/cache/cargo-target /data/cache/rustup /data/cache/bun-cache
+chown -R root:omp /data/cache /data/workspaces/_pool
+chmod -R u=rwX,g=rwsX,o= /data/cache /data/workspaces/_pool
+chmod 0700 /data/logs
+
+mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent
+chown -R root:root /srv/agent-home || true
+chmod -R a+rX /srv/agent-home || true
+
+for db_file in /data/robomp.sqlite /data/robomp.sqlite-wal /data/robomp.sqlite-shm; do
+    if [ -e "$db_file" ]; then
+        chown root:root "$db_file"
+        chmod 0600 "$db_file"
+    fi
+done
+
 exec "$@"

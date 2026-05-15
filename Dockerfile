@@ -139,6 +139,8 @@ RUN pip install --upgrade pip \
         "click>=8.1" \
     && pip install --no-deps .
 
+RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent
+
 COPY entrypoint.sh /usr/local/bin/robomp-entrypoint
 RUN chmod +x /usr/local/bin/robomp-entrypoint
 
