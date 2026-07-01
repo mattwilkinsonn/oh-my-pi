@@ -919,7 +919,7 @@ export class CommandController {
 		this.ctx.streamingMessage = undefined;
 		this.ctx.pendingTools.clear();
 		this.ctx.statusLine.invalidate();
-		this.ctx.updateEditorTopBorder();
+		this.ctx.updateEditorBorderColor();
 		const noun = result.droppedCount === 1 ? "message" : "messages";
 		this.ctx.present([
 			new Spacer(1),
