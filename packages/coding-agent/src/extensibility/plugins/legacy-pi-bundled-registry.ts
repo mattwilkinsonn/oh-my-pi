@@ -169,7 +169,6 @@ import * as bundledPiAiUtilsSdkStreamTimeout from "@oh-my-pi/pi-ai/utils/sdk-str
 import * as bundledPiAiUtilsSseDebug from "@oh-my-pi/pi-ai/utils/sse-debug";
 import * as bundledPiAiUtilsStreamMarkupHealing from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
 import * as bundledPiAiUtilsThinkingLoop from "@oh-my-pi/pi-ai/utils/thinking-loop";
-import * as bundledPiAiUtilsTlsFetch from "@oh-my-pi/pi-ai/utils/tls-fetch";
 import * as bundledPiAiUtilsToolCallLoopGuard from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
 import * as bundledPiAiUtilsToolChoice from "@oh-my-pi/pi-ai/utils/tool-choice";
 import * as bundledPiAiUtilsValidation from "@oh-my-pi/pi-ai/utils/validation";
@@ -412,7 +411,6 @@ import * as bundledPiCodingAgentEvalPyToolBridge from "@oh-my-pi/pi-coding-agent
 import * as bundledPiCodingAgentExa from "@oh-my-pi/pi-coding-agent/exa";
 import * as bundledPiCodingAgentExaMcpClient from "@oh-my-pi/pi-coding-agent/exa/mcp-client";
 import * as bundledPiCodingAgentExaTypes from "@oh-my-pi/pi-coding-agent/exa/types";
-import * as bundledPiCodingAgentExecBashCwdSync from "@oh-my-pi/pi-coding-agent/exec/bash-cwd-sync";
 import * as bundledPiCodingAgentExecBashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import * as bundledPiCodingAgentExecDirenv from "@oh-my-pi/pi-coding-agent/exec/direnv";
 import * as bundledPiCodingAgentExecExec from "@oh-my-pi/pi-coding-agent/exec/exec";
@@ -887,6 +885,7 @@ import * as bundledPiCodingAgentUtilsEditMode from "@oh-my-pi/pi-coding-agent/ut
 import * as bundledPiCodingAgentUtilsEnhancedPaste from "@oh-my-pi/pi-coding-agent/utils/enhanced-paste";
 import * as bundledPiCodingAgentUtilsEventBus from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as bundledPiCodingAgentUtilsExternalEditor from "@oh-my-pi/pi-coding-agent/utils/external-editor";
+import * as bundledPiCodingAgentUtilsFetchTimeout from "@oh-my-pi/pi-coding-agent/utils/fetch-timeout";
 import * as bundledPiCodingAgentUtilsFileDisplayMode from "@oh-my-pi/pi-coding-agent/utils/file-display-mode";
 import * as bundledPiCodingAgentUtilsFileMentions from "@oh-my-pi/pi-coding-agent/utils/file-mentions";
 import * as bundledPiCodingAgentUtilsGit from "@oh-my-pi/pi-coding-agent/utils/git";
@@ -1288,7 +1287,6 @@ export const BUNDLED_PI_REGISTRY: Readonly<Record<string, Readonly<Record<string
 		Record<string, unknown>
 	>,
 	"@oh-my-pi/pi-ai/utils/thinking-loop": bundledPiAiUtilsThinkingLoop as unknown as Readonly<Record<string, unknown>>,
-	"@oh-my-pi/pi-ai/utils/tls-fetch": bundledPiAiUtilsTlsFetch as unknown as Readonly<Record<string, unknown>>,
 	"@oh-my-pi/pi-ai/utils/tool-call-loop-guard": bundledPiAiUtilsToolCallLoopGuard as unknown as Readonly<
 		Record<string, unknown>
 	>,
@@ -2026,9 +2024,6 @@ export const BUNDLED_PI_REGISTRY: Readonly<Record<string, Readonly<Record<string
 		Record<string, unknown>
 	>,
 	"@oh-my-pi/pi-coding-agent/exa/types": bundledPiCodingAgentExaTypes as unknown as Readonly<Record<string, unknown>>,
-	"@oh-my-pi/pi-coding-agent/exec/bash-cwd-sync": bundledPiCodingAgentExecBashCwdSync as unknown as Readonly<
-		Record<string, unknown>
-	>,
 	"@oh-my-pi/pi-coding-agent/exec/bash-executor": bundledPiCodingAgentExecBashExecutor as unknown as Readonly<
 		Record<string, unknown>
 	>,
@@ -3139,6 +3134,9 @@ export const BUNDLED_PI_REGISTRY: Readonly<Record<string, Readonly<Record<string
 		Record<string, unknown>
 	>,
 	"@oh-my-pi/pi-coding-agent/utils/external-editor": bundledPiCodingAgentUtilsExternalEditor as unknown as Readonly<
+		Record<string, unknown>
+	>,
+	"@oh-my-pi/pi-coding-agent/utils/fetch-timeout": bundledPiCodingAgentUtilsFetchTimeout as unknown as Readonly<
 		Record<string, unknown>
 	>,
 	"@oh-my-pi/pi-coding-agent/utils/file-display-mode": bundledPiCodingAgentUtilsFileDisplayMode as unknown as Readonly<
