@@ -115,6 +115,7 @@ export type SymbolKey =
 	| "icon.cacheMiss"
 	| "icon.input"
 	| "icon.output"
+	| "icon.throughput"
 	| "icon.host"
 	| "icon.session"
 	| "icon.package"
@@ -158,6 +159,8 @@ export type SymbolKey =
 	| "md.hrChar"
 	| "md.bullet"
 	| "md.colorSwatch"
+	// Advisor note rail
+	| "advisor.rail"
 	// Language/file type icons
 	| "lang.default"
 	| "lang.typescript"
@@ -319,6 +322,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.cacheMiss": "⊘",
 	"icon.input": "⤵",
 	"icon.output": "⤴",
+	"icon.throughput": "⚡",
 	"icon.host": "🖥",
 	"icon.session": "🆔",
 	"icon.package": "📦",
@@ -362,6 +366,8 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"md.hrChar": "─",
 	"md.bullet": "•",
 	"md.colorSwatch": "■",
+	// Advisor note rail (heavier than md.quoteBorder so notes read as a distinct voice)
+	"advisor.rail": "▎",
 	// Language/file icons (emoji-centric, no Nerd Font required)
 	"lang.default": "⌘",
 	"lang.typescript": "🟦",
@@ -597,6 +603,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.input": "\uf090",
 	// pick:  | alt:  →
 	"icon.output": "\uf08b",
+	// pick:  (nf-fa-tachometer) | alt:  ⚡ ↬
+	"icon.throughput": "\uf0e4",
 	// pick:  | alt:  
 	"icon.host": "\uf109",
 	// pick:  | alt:  
@@ -671,6 +679,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"md.bullet": "\uf111",
 	// pick: ■ | alt:  (U+F096)
 	"md.colorSwatch": "■",
+	// pick: ▎ | alt: ┃ │
+	"advisor.rail": "▎",
 	// Language icons (nerd font devicons)
 	"lang.default": "",
 	"lang.typescript": "\u{E628}",
@@ -827,10 +837,11 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.ghost": "@",
 	"icon.agents": "AG",
 	"icon.job": "bg",
+	"icon.output": "out:",
+	"icon.throughput": "tok/s:",
 	"icon.cache": "cache",
 	"icon.cacheMiss": "!",
 	"icon.input": "in:",
-	"icon.output": "out:",
 	"icon.host": "host",
 	"icon.session": "id",
 	"icon.package": "[P]",
@@ -872,6 +883,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"md.hrChar": "-",
 	"md.bullet": "*",
 	"md.colorSwatch": "[]",
+	"advisor.rail": "|",
 	// Language icons (ASCII uses abbreviations)
 	"lang.default": "code",
 	"lang.typescript": "ts",
@@ -1820,6 +1832,7 @@ export class Theme {
 			cacheMiss: this.#symbols["icon.cacheMiss"],
 			input: this.#symbols["icon.input"],
 			output: this.#symbols["icon.output"],
+			throughput: this.#symbols["icon.throughput"],
 			host: this.#symbols["icon.host"],
 			session: this.#symbols["icon.session"],
 			package: this.#symbols["icon.package"],

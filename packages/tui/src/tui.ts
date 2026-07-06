@@ -212,6 +212,11 @@ export interface OverlayFocusOwner {
  * dropped row or an audit re-anchor spray. Provisional live blocks (collapsing
  * tool/edit previews whose head is a throwaway tail window) omit it. Defaults to
  * `commitSafeEnd ?? liveRegionStart` when absent.
+ * `getNativeScrollbackOfferSafeEnd` optionally reports the deepest prefix row
+ * that may physically enter native scrollback while still remaining audited.
+ * This is for finalized lower siblings under a live block: the rows may scroll
+ * off, but a later live-block insertion above them must trigger repair instead
+ * of becoming durable audit-exempt history.
  *
  * When several root children report a seam in the same frame, the topmost
  * one (and its commit-safe / snapshot-safe extension) defines the boundary:
@@ -222,6 +227,7 @@ export interface NativeScrollbackLiveRegion {
 	getNativeScrollbackLiveRegionStart(): number | undefined;
 	getNativeScrollbackCommitSafeEnd?(): number | undefined;
 	getNativeScrollbackSnapshotSafeEnd?(): number | undefined;
+	getNativeScrollbackOfferSafeEnd?(): number | undefined;
 }
 
 export interface NativeScrollbackCommittedRows {
@@ -249,6 +255,10 @@ function getNativeScrollbackCommitSafeEnd(component: Component): number | undefi
 
 function getNativeScrollbackSnapshotSafeEnd(component: Component): number | undefined {
 	return (component as Component & Partial<NativeScrollbackLiveRegion>).getNativeScrollbackSnapshotSafeEnd?.();
+}
+
+function getNativeScrollbackOfferSafeEnd(component: Component): number | undefined {
+	return (component as Component & Partial<NativeScrollbackLiveRegion>).getNativeScrollbackOfferSafeEnd?.();
 }
 
 /**
@@ -628,6 +638,7 @@ interface FrameSegment {
 	liveLocalStart?: number;
 	commitLocalEnd?: number;
 	snapshotLocalEnd?: number;
+	offerLocalEnd?: number;
 }
 
 /** Depth-first identity search through `Container`-shaped children. */
@@ -1009,23 +1020,27 @@ export class TUI extends Container {
 	// #auditCommittedPrefix). Holds references to component-cached strings, so
 	// the audit is a pointer walk in the common case.
 	#committedPrefix: string[] = [];
-	// The committed prefix [0, committedRows) splits into three audit zones by
-	// two monotone marks auditRows ≤ durableRows ≤ committedRows:
+	// The committed prefix [0, committedRows) splits into four zones by three
+	// monotone marks auditRows ≤ durableRows ≤ offerRows ≤ committedRows:
 	//   [0, auditRows)              BYTE-STABLE — audited (re-anchor on any shift).
 	//   [auditRows, durableRows)    DURABLE snapshot — exempt: rows may drift in
 	//       place (a streaming table widening) without re-anchoring, so their
 	//       expected drift never sprays duplicate snapshots.
-	//   [durableRows, committedRows) FORCED-overflow — audited: rows committed
+	//   [durableRows, offerRows)    OFFERED — audited: rows were allowed into
+	//       native scrollback while a live block above could still shift them.
+	//       A mismatch here requires a destructive replay, not a duplicate tail.
+	//   [offerRows, committedRows)  FORCED-overflow — audited: rows committed
 	//       only because they scrolled above the window under a commit-unstable
 	//       barrier; auditing them re-anchors (duplication, never loss) when the
 	//       barrier later shifts/finalizes/removes, instead of stranding a stale
 	//       prefix that silently drops the rows beneath it.
-	// Both marks re-base on a wholesale re-slice (full paint / shrink / geometry)
-	// and otherwise advance per the persistence rules in #updateCommittedAuditRows.
+	// Marks re-base on a wholesale re-slice (full paint / shrink / geometry) and
+	// otherwise advance per the persistence rules in #updateCommittedAuditRows.
 	// #auditCommittedPrefix audits [0, committedRows) skipping the exempt window
 	// [auditRows, durableRows).
 	#committedPrefixAuditRows = 0;
 	#committedPrefixDurableRows = 0;
+	#committedPrefixOfferRows = 0;
 	// Frame row currently mapped to screen row 0. Monotonic between full
 	// paints: a shrink never re-exposes scrolled-off rows (they cannot be
 	// un-scrolled without rewriting history); live rows repaint at fixed
@@ -1036,6 +1051,7 @@ export class TUI extends Container {
 	#nativeScrollbackLiveRegionStart: number | undefined;
 	#nativeScrollbackCommitSafeEnd: number | undefined;
 	#nativeScrollbackSnapshotSafeEnd: number | undefined;
+	#nativeScrollbackOfferSafeEnd: number | undefined;
 	#fullRedrawCount = 0;
 	// Caps how many inline images render as live graphics; older ones fall back
 	// to text via a purge + full redraw. Cap is configured by the host app.
@@ -1155,6 +1171,7 @@ export class TUI extends Container {
 		this.#nativeScrollbackLiveRegionStart = undefined;
 		this.#nativeScrollbackCommitSafeEnd = undefined;
 		this.#nativeScrollbackSnapshotSafeEnd = undefined;
+		this.#nativeScrollbackOfferSafeEnd = undefined;
 		const children = this.children;
 		const previousSegments = this.#frameSegments;
 		const segments: FrameSegment[] = new Array(children.length);
@@ -1177,12 +1194,14 @@ export class TUI extends Container {
 			let liveLocalStart: number | undefined;
 			let commitLocalEnd: number | undefined;
 			let snapshotLocalEnd: number | undefined;
+			let offerLocalEnd: number | undefined;
 			let reported: number | undefined;
 			if (reuse) {
 				childLines = previous.lines;
 				liveLocalStart = previous.liveLocalStart;
 				commitLocalEnd = previous.commitLocalEnd;
 				snapshotLocalEnd = previous.snapshotLocalEnd;
+				offerLocalEnd = previous.offerLocalEnd;
 			} else {
 				// Feed the engine's committed-row claim (from the previous frame's
 				// emit) before rendering so the child can skip re-deriving blocks
@@ -1211,6 +1230,13 @@ export class TUI extends Container {
 							? Math.max(snapshotFloor, Math.min(childLines.length, Math.trunc(snapshotSafeEnd)))
 							: childLines.length;
 					}
+					const offerSafeEnd = getNativeScrollbackOfferSafeEnd(child);
+					if (offerSafeEnd !== undefined) {
+						const offerFloor = snapshotLocalEnd ?? commitLocalEnd ?? liveLocalStart;
+						offerLocalEnd = Number.isFinite(offerSafeEnd)
+							? Math.max(offerFloor, Math.min(childLines.length, Math.trunc(offerSafeEnd)))
+							: childLines.length;
+					}
 				}
 				// Consume the stability report unconditionally for implementers:
 				// reading re-bases the component's baseline to the state this
@@ -1233,6 +1259,9 @@ export class TUI extends Container {
 				}
 				if (snapshotLocalEnd !== undefined) {
 					this.#nativeScrollbackSnapshotSafeEnd = offset + snapshotLocalEnd;
+				}
+				if (offerLocalEnd !== undefined) {
+					this.#nativeScrollbackOfferSafeEnd = offset + offerLocalEnd;
 				}
 			}
 			if (chainStable) {
@@ -1264,6 +1293,7 @@ export class TUI extends Container {
 				liveLocalStart,
 				commitLocalEnd,
 				snapshotLocalEnd,
+				offerLocalEnd,
 			};
 			offset += childLines.length;
 		}
@@ -2664,6 +2694,7 @@ export class TUI extends Container {
 		const liveRegionStart = this.#nativeScrollbackLiveRegionStart;
 		const commitSafeEnd = this.#nativeScrollbackCommitSafeEnd;
 		const snapshotSafeEnd = this.#nativeScrollbackSnapshotSafeEnd;
+		const offerSafeEnd = this.#nativeScrollbackOfferSafeEnd;
 
 		// Commit boundaries (also used by the window/commit math in section 3),
 		// hoisted above the audit gate because the resync needs byteStableBoundary
@@ -2671,22 +2702,27 @@ export class TUI extends Container {
 		// The commit floor is windowTop in every non-frozen path (see chunkTo), so
 		// whatever scrolls above the window is committed — never committed nowhere
 		// AND painted nowhere (the loss bug). The boundaries no longer gate the
-		// commit; they define the audit-exempt span. byteStableBoundary: rows below
+		// commit; they define audit and repair spans. byteStableBoundary: rows below
 		// it are byte-stable (never re-layout), audited. durableBoundary: rows in
 		// [byteStableBoundary, durableBoundary) are durable — permanent on scroll-off
 		// but may drift in place (a streaming table re-aligning), committed
-		// audit-EXEMPT. Rows at/beyond durableBoundary committed only because they
-		// scrolled above the window (a commit-unstable barrier over a long tail) are
-		// forced-overflow rows: audited, so a later shift/finalize/removal re-anchors
-		// (duplication, never loss) instead of stranding a stale prefix. Built on the
-		// finalized prefix (live-region start); the whole frame when the root reports
-		// no seam (shell semantics: whatever scrolls is final).
+		// audit-EXEMPT. offerBoundary: rows in [durableBoundary, offerBoundary)
+		// were explicitly allowed to enter native scrollback while remaining
+		// audited; if they later shift, the stale physical history is repaired by a
+		// destructive replay instead of duplicate recommit. Rows at/beyond
+		// offerBoundary committed only because they scrolled above the window (a
+		// commit-unstable barrier over a long tail) are forced-overflow rows:
+		// audited, so a later shift/finalize/removal re-anchors (duplication, never
+		// loss) instead of stranding a stale prefix. Built on the finalized prefix
+		// (live-region start); the whole frame when the root reports no seam (shell
+		// semantics: whatever scrolls is final).
 		const frameLength = rawFrame.length;
 		const byteStableBoundary = Math.max(0, Math.min(frameLength, commitSafeEnd ?? liveRegionStart ?? frameLength));
 		const durableBoundary = Math.max(
 			byteStableBoundary,
 			Math.min(frameLength, snapshotSafeEnd ?? byteStableBoundary),
 		);
+		const offerBoundary = Math.max(durableBoundary, Math.min(frameLength, offerSafeEnd ?? durableBoundary));
 
 		// 2. Transition state captured before any emitter runs.
 		const prevWindowTop = this.#windowTopRow;
@@ -2719,18 +2755,28 @@ export class TUI extends Container {
 		let committedRowsResynced = false;
 		// Audit covers [0, auditRows) and the forced suffix [durableRows,
 		// committedRows); the durable middle [auditRows, durableRows) is exempt
-		// (in-place drift). Two reasons to run the audit this frame:
+		// (in-place drift). Three reasons to run the audit this frame:
 		//  - the stable prefix does not cover every audited row (auditUpper); or
 		//  - a forced-overflow row this frame became durable/permanent
-		//    (committedPrefixDurableRows < hardAuditEnd): the barrier above it
-		//    finalized, so its committed bytes must be re-checked even though the
-		//    stable prefix says nothing moved — a stale committed copy there would
-		//    silently drop the row. The hard scan in findCommittedPrefixResync
-		//    covers [durableRows, hardAuditEnd) in full (no tail-sample miss).
+		//    (committedPrefixDurableRows < min(committed, durableBoundary)): the
+		//    barrier above it finalized, so its committed bytes must be re-checked
+		//    even though the stable prefix says nothing moved — a stale committed
+		//    copy there would silently drop the row; or
+		//  - a forced-overflow row this frame joined the offered zone
+		//    (committedPrefixOfferRows < min(committed, offerBoundary)): a
+		//    finalized sibling under a live block asks for destructive-replay
+		//    repair, so a single-row shift there must be caught even if
+		//    tail-sample tolerance would otherwise skip it.
+		// The hard scan in findCommittedPrefixResync covers [durableRows,
+		// hardAuditEnd) in full (no tail-sample miss).
 		const auditUpper =
 			this.#committedPrefixDurableRows < this.#committedRows ? this.#committedRows : this.#committedPrefixAuditRows;
-		const hardAuditEnd = Math.min(this.#committedRows, durableBoundary);
-		const needHardAudit = this.#committedPrefixDurableRows < hardAuditEnd;
+		const durableHardEnd = Math.min(this.#committedRows, durableBoundary);
+		const offerHardEnd = Math.min(this.#committedRows, offerBoundary);
+		const hardAuditEnd = Math.max(durableHardEnd, offerHardEnd);
+		const needHardAudit =
+			this.#committedPrefixDurableRows < durableHardEnd || this.#committedPrefixOfferRows < offerHardEnd;
+		let repairOfferedScrollback = false;
 		const auditRan =
 			this.#hasEverRendered &&
 			!geometryChanged &&
@@ -2738,14 +2784,21 @@ export class TUI extends Container {
 			(this.#renderStablePrefixRows < auditUpper || needHardAudit);
 		if (auditRan) {
 			const committedRowsBeforeAudit = this.#committedRows;
-			this.#auditCommittedPrefix(rawFrame, durableBoundary);
+			const offeredRowsBeforeAudit = this.#committedPrefixOfferRows;
+			const durableRowsBeforeAudit = this.#committedPrefixDurableRows;
+			this.#auditCommittedPrefix(rawFrame, hardAuditEnd);
 			committedRowsResynced = this.#committedRows !== committedRowsBeforeAudit;
+			repairOfferedScrollback =
+				offeredRowsBeforeAudit > durableRowsBeforeAudit &&
+				committedRowsResynced &&
+				this.#committedRows < offeredRowsBeforeAudit;
 		}
 		// Committed-prefix state this frame's commit math extends from (post-audit).
 		// Drives the audit-rows / durable-rows caps recomputed after the emit.
 		const preCommitRows = this.#committedRows;
 		const preCommitAuditRows = this.#committedPrefixAuditRows;
 		const preCommitDurableRows = this.#committedPrefixDurableRows;
+		const preCommitOfferRows = this.#committedPrefixOfferRows;
 
 		// 3. Window and commit math (lengths only; content prepared below).
 		let hasVisibleOverlay = false;
@@ -2763,7 +2816,7 @@ export class TUI extends Container {
 		// place, because an ED3 rewrap is unsafe (pane scrollback / alt-screen
 		// feedback loop), so committed history keeps its old wrap.
 		const firstPaint = !this.#hasEverRendered;
-		const replaceRequested = this.#clearScrollbackOnNextRender;
+		const replaceRequested = this.#clearScrollbackOnNextRender || repairOfferedScrollback;
 		const geometryRebuild = geometryChanged && !resizeRepaintsInPlace();
 		const fullPaint = firstPaint || replaceRequested || geometryRebuild;
 		let windowTop: number;
@@ -2836,6 +2889,7 @@ export class TUI extends Container {
 			}
 			window = this.#prepareLinesArray(window, width);
 		}
+		const cursorTrackingLineCount = hasVisibleOverlay ? Math.max(frame.length, windowTop + height) : frame.length;
 
 		const intent: RenderIntent = fullPaint
 			? { kind: "fullPaint", clearScrollback: replaceRequested || geometryRebuild ? !isMultiplexerSession() : false }
@@ -2866,6 +2920,7 @@ export class TUI extends Container {
 				clearScrollback: intent.clearScrollback,
 				chunkTo,
 				windowTop,
+				cursorTrackingLineCount,
 			});
 			this.#committedPrefix = rawFrame.slice(0, chunkTo);
 			this.#updateCommittedAuditRows(
@@ -2873,8 +2928,10 @@ export class TUI extends Container {
 				preCommitRows,
 				preCommitAuditRows,
 				preCommitDurableRows,
+				preCommitOfferRows,
 				byteStableBoundary,
 				durableBoundary,
+				offerBoundary,
 				false,
 			);
 			this.#clearScrollbackOnNextRender = false;
@@ -2891,6 +2948,8 @@ export class TUI extends Container {
 			prevWindowTop,
 			prevHardwareCursorRow,
 			forceWindowRewrite: this.#forceViewportRepaintOnNextRender || (geometryChanged && resizeRepaintsInPlace()),
+			repaintVirtualScrollInPlace: hasVisibleOverlay,
+			cursorTrackingLineCount,
 		});
 		for (let i = this.#committedPrefix.length; i < chunkTo; i++) {
 			this.#committedPrefix.push(rawFrame[i] ?? "");
@@ -2900,8 +2959,10 @@ export class TUI extends Container {
 			preCommitRows,
 			preCommitAuditRows,
 			preCommitDurableRows,
+			preCommitOfferRows,
 			byteStableBoundary,
 			durableBoundary,
+			offerBoundary,
 			auditRan,
 		);
 	}
@@ -2928,6 +2989,7 @@ export class TUI extends Container {
 		this.#committedRows = resyncTo;
 		this.#committedPrefixAuditRows = Math.min(this.#committedPrefixAuditRows, resyncTo);
 		this.#committedPrefixDurableRows = Math.min(this.#committedPrefixDurableRows, resyncTo);
+		this.#committedPrefixOfferRows = Math.min(this.#committedPrefixOfferRows, resyncTo);
 		prefix.length = resyncTo;
 		if ($flag("PI_DEBUG_REDRAW")) {
 			const msg = `[${new Date().toISOString()}] commit resync: committed prefix diverged at row ${resyncTo}; recommitting\n`;
@@ -2940,21 +3002,24 @@ export class TUI extends Container {
 	 * #committedPrefixAuditRows field doc for the three audit zones).
 	 *
 	 * auditRows tracks the byte-stable boundary; durableRows the durable snapshot
-	 * boundary. A wholesale re-slice (full paint / shrink / geometry) re-bases
-	 * each mark from the current frame (min(committed, boundary)). An incremental
-	 * extend keeps a mark once a row past it has committed (mark < committed): a
-	 * later RISE in a boundary (a table finalizing) must neither pull
-	 * already-committed stale snapshots back under the byte-stable cap nor
-	 * retroactively exempt forced-overflow rows already audited. durableRows is
-	 * floored at auditRows so the exempt window can never invert.
+	 * boundary; offerRows the deepest explicit audited-offer boundary. A wholesale
+	 * re-slice (full paint / shrink / geometry) re-bases each mark from the
+	 * current frame. An incremental extend keeps a mark once a row past it has
+	 * committed (mark < committed): a later RISE in a boundary (a table finalizing)
+	 * must neither pull already-committed stale snapshots back under the
+	 * byte-stable cap nor retroactively exempt forced-overflow rows already
+	 * audited. durableRows is floored at auditRows; offerRows is floored at
+	 * durableRows.
 	 */
 	#updateCommittedAuditRows(
 		resliced: boolean,
 		preCommittedRows: number,
 		preAuditRows: number,
 		preDurableRows: number,
+		preOfferRows: number,
 		byteStableBoundary: number,
 		durableBoundary: number,
+		offerBoundary: number,
 		hardAudited: boolean,
 	): void {
 		const committed = this.#committedRows;
@@ -2971,8 +3036,18 @@ export class TUI extends Container {
 			resliced || preDurableRows >= preCommittedRows || hardAudited
 				? Math.min(committed, durableBoundary)
 				: Math.min(preDurableRows, committed);
+		// offerRows may EXTEND to include forced-overflow rows within a
+		// newly-visible offerBoundary — unlike auditRows/durableRows, retroactive
+		// promotion is safe: both offered and forced-overflow zones stay
+		// audited; offered only switches divergence repair from tolerant recommit
+		// to destructive replay (stronger, not weaker). A dropped offerBoundary
+		// still keeps the durability rule via `preOfferRows` (never demote
+		// already-offered rows to forced-overflow).
+		const offerCap = Math.min(committed, offerBoundary);
+		const offerRows = resliced ? offerCap : Math.max(Math.min(preOfferRows, committed), offerCap);
 		this.#committedPrefixAuditRows = auditRows;
 		this.#committedPrefixDurableRows = Math.max(auditRows, durableRows);
+		this.#committedPrefixOfferRows = Math.max(this.#committedPrefixDurableRows, offerRows);
 	}
 
 	/**
@@ -3272,26 +3347,48 @@ export class TUI extends Container {
 		cursorPos: { row: number; col: number } | null,
 		purgeSequence: string,
 		imageTransmitBuffer: string,
-		options: { clearScrollback: boolean; chunkTo: number; windowTop: number },
+		options: {
+			clearScrollback: boolean;
+			chunkTo: number;
+			windowTop: number;
+			cursorTrackingLineCount: number;
+		},
 	): void {
 		this.#fullRedrawCount += 1;
-		const { chunkTo, windowTop } = options;
-		const paintFrame = new Array<string>(chunkTo + height);
-		for (let i = 0; i < chunkTo; i++) paintFrame[i] = frame[i] ?? "";
-		for (let screenRow = 0; screenRow < height; screenRow++) {
-			paintFrame[chunkTo + screenRow] = window[screenRow] ?? "";
-		}
-		let untruncatedPaintCursorPos: { row: number; col: number } | null = null;
+		const { chunkTo, windowTop, cursorTrackingLineCount } = options;
+		// Map the frame-space cursor into paint space: committed-prefix rows
+		// keep their index, visible-window rows land after the prefix, and a
+		// cursor in neither region (hidden behind the overlay gap) hides.
+		let paintCursorPos: { row: number; col: number } | null = null;
 		if (cursorPos !== null) {
 			if (cursorPos.row < chunkTo) {
-				untruncatedPaintCursorPos = cursorPos;
+				paintCursorPos = cursorPos;
 			} else if (cursorPos.row >= windowTop && cursorPos.row < windowTop + height) {
-				untruncatedPaintCursorPos = { row: chunkTo + cursorPos.row - windowTop, col: cursorPos.col };
+				paintCursorPos = { row: chunkTo + cursorPos.row - windowTop, col: cursorPos.col };
 			}
 		}
-		const paint = this.#truncateLargeConptyFrame(paintFrame, width, height, untruncatedPaintCursorPos);
-		const paintLines = paint.lines;
-		const paintCursorPos = paint.cursorPos;
+		// ConPTY hosts bound the replay: merge prefix + window into one array
+		// so #truncateLargeConptyFrame can measure the payload and retain only
+		// the tail. Gated on the host check — everywhere else the merge would
+		// copy a pointer per committed row (a 50k-row session = 50k-entry
+		// array per resize step / theme change / session replace) just to be
+		// returned unchanged. `paintLines` stays null unless truncation
+		// actually rewrote the replay.
+		let paintLines: string[] | null = null;
+		let paintLineCount = chunkTo + height;
+		if (isConPTYHosted()) {
+			const merged = new Array<string>(chunkTo + height);
+			for (let i = 0; i < chunkTo; i++) merged[i] = frame[i] ?? "";
+			for (let screenRow = 0; screenRow < height; screenRow++) {
+				merged[chunkTo + screenRow] = window[screenRow] ?? "";
+			}
+			const paint = this.#truncateLargeConptyFrame(merged, width, height, paintCursorPos);
+			if (paint.lines !== merged) {
+				paintLines = paint.lines;
+				paintLineCount = paint.lines.length;
+				paintCursorPos = paint.cursorPos;
+			}
+		}
 		let buffer = this.#paintBeginSequence + this.#leaveResizeAltSequence() + purgeSequence;
 		if (options.clearScrollback) {
 			buffer += "\x1b[2J\x1b[H\x1b[3J";
@@ -3308,21 +3405,41 @@ export class TUI extends Container {
 		// DECCARA fills optimize only the rows that stay visible; history-bound
 		// rows are written as full styled strings (their background must
 		// survive in scrollback, which DECCARA cannot reach).
-		const visibleStart = Math.max(0, paintLines.length - height);
+		const visibleStart = Math.max(0, paintLineCount - height);
 		let fillSequence = "";
 		let visibleTexts: string[] | null = null;
-		if (this.#deccaraFillsEnabled() && visibleStart < paintLines.length) {
-			const visible = new Array<string>(paintLines.length - visibleStart);
-			for (let k = 0; k < visible.length; k++) visible[k] = paintLines[visibleStart + k] ?? "";
+		if (this.#deccaraFillsEnabled() && visibleStart < paintLineCount) {
+			// Untruncated, the visible slice is exactly the caller's window
+			// (visibleStart === chunkTo) — reuse it rather than copying;
+			// planDeccaraFills fills its own `texts` and never mutates input.
+			let visible = window;
+			if (paintLines !== null) {
+				visible = new Array<string>(paintLineCount - visibleStart);
+				for (let k = 0; k < visible.length; k++) visible[k] = paintLines[visibleStart + k] ?? "";
+			}
 			const plan = planDeccaraFills(visible, width);
 			visibleTexts = plan.texts;
 			fillSequence = plan.sequence;
 		}
-		for (let i = 0; i < paintLines.length; i++) {
-			if (i > 0) buffer += "\r\n";
-			buffer += this.#terminalLine(
-				visibleTexts && i >= visibleStart ? visibleTexts[i - visibleStart] : (paintLines[i] ?? ""),
-			);
+		if (paintLines === null) {
+			// Common path: emit straight from the source arrays (the
+			// pre-merge two-loop form); byte-identical to replaying the
+			// merged array.
+			for (let i = 0; i < chunkTo; i++) {
+				if (i > 0) buffer += "\r\n";
+				buffer += this.#terminalLine(frame[i] ?? "");
+			}
+			for (let screenRow = 0; screenRow < height; screenRow++) {
+				if (chunkTo + screenRow > 0) buffer += "\r\n";
+				buffer += this.#terminalLine(visibleTexts ? (visibleTexts[screenRow] ?? "") : (window[screenRow] ?? ""));
+			}
+		} else {
+			for (let i = 0; i < paintLines.length; i++) {
+				if (i > 0) buffer += "\r\n";
+				buffer += this.#terminalLine(
+					visibleTexts && i >= visibleStart ? visibleTexts[i - visibleStart] : (paintLines[i] ?? ""),
+				);
+			}
 		}
 		buffer += fillSequence;
 		// Park the hardware cursor at real content bottom, not the padded
@@ -3332,13 +3449,15 @@ export class TUI extends Container {
 		const parkUp = height - contentRows;
 		if (parkUp > 0) buffer += `\x1b[${parkUp}A`;
 		const contentBottomRow = windowTop + contentRows - 1;
-		const paintContentBottomRow = Math.max(0, paintLines.length - 1 - parkUp);
-		const cursorControl = this.#cursorControlSequence(paintCursorPos, paintLines.length, paintContentBottomRow);
+		const paintContentBottomRow = Math.max(0, paintLineCount - 1 - parkUp);
+		const cursorControl = this.#cursorControlSequence(paintCursorPos, paintLineCount, paintContentBottomRow);
 		buffer += cursorControl.seq;
 		buffer += this.#paintEndSequence;
 		this.terminal.write(buffer);
 
-		const committedCursorState = paintCursorPos ? this.#targetHardwareCursorState(cursorPos, frame.length) : null;
+		const committedCursorState = paintCursorPos
+			? this.#targetHardwareCursorState(cursorPos, cursorTrackingLineCount)
+			: null;
 		const committedCursor = committedCursorState
 			? {
 					toRow: committedCursorState.row,
@@ -3607,9 +3726,19 @@ export class TUI extends Container {
 			prevWindowTop: number;
 			prevHardwareCursorRow: number;
 			forceWindowRewrite: boolean;
+			repaintVirtualScrollInPlace: boolean;
+			cursorTrackingLineCount: number;
 		},
 	): void {
-		const { chunkTo, windowTop, prevWindowTop, prevHardwareCursorRow, forceWindowRewrite } = options;
+		const {
+			chunkTo,
+			windowTop,
+			prevWindowTop,
+			prevHardwareCursorRow,
+			forceWindowRewrite,
+			repaintVirtualScrollInPlace,
+			cursorTrackingLineCount,
+		} = options;
 		const chunkFrom = this.#committedRows;
 		const chunkLength = chunkTo - chunkFrom;
 		const scroll = windowTop - prevWindowTop;
@@ -3660,7 +3789,7 @@ export class TUI extends Container {
 					}
 					cursorFromRow = windowTop + lastChanged;
 				}
-				const cursorControl = this.#cursorControlSequence(cursorPos, frame.length, cursorFromRow);
+				const cursorControl = this.#cursorControlSequence(cursorPos, cursorTrackingLineCount, cursorFromRow);
 				buffer += cursorControl.seq;
 				buffer += this.#paintEndSequence;
 				this.terminal.write(buffer);
@@ -3671,12 +3800,17 @@ export class TUI extends Container {
 			}
 		}
 
-		// In-window diff: nothing scrolls, nothing commits.
-		if (chunkLength === 0 && scroll === 0) {
-			if (forceWindowRewrite) this.#fullRedrawCount += 1;
-			let firstChanged = forceWindowRewrite ? 0 : -1;
-			let lastChanged = forceWindowRewrite ? height - 1 : -1;
-			if (!forceWindowRewrite) {
+		// In-window diff: nothing commits. While an overlay is visible, repaint
+		// the full viewport in place from a top-clamped cursor origin. Overlay
+		// cursor-only frames can leave the tracked row behind the physical cursor;
+		// a relative partial rewrite from that stale origin can CRLF on the bottom
+		// row and scroll native history without appending to the commit tape.
+		const overlayInPlaceRewrite = repaintVirtualScrollInPlace;
+		if (chunkLength === 0 && (scroll === 0 || overlayInPlaceRewrite)) {
+			if (forceWindowRewrite || overlayInPlaceRewrite) this.#fullRedrawCount += 1;
+			let firstChanged = forceWindowRewrite || overlayInPlaceRewrite ? 0 : -1;
+			let lastChanged = forceWindowRewrite || overlayInPlaceRewrite ? height - 1 : -1;
+			if (!forceWindowRewrite && !overlayInPlaceRewrite) {
 				const comparable = previousWindow.length === height;
 				for (let r = 0; r < height; r++) {
 					if (comparable && (window[r] ?? "") === (previousWindow[r] ?? "")) continue;
@@ -3686,15 +3820,22 @@ export class TUI extends Container {
 			}
 			if (firstChanged === -1) {
 				if (purgeSequence.length > 0) this.terminal.write(purgeSequence);
-				this.#writeCursorPosition(cursorPos, frame.length);
+				this.#writeCursorPosition(cursorPos, cursorTrackingLineCount);
 				this.#previousWidth = width;
 				this.#previousHeight = height;
 				return;
 			}
 			let buffer = this.#paintBeginSequence + purgeSequence;
-			const rowDelta = firstChanged - currentScreenRow;
-			if (rowDelta > 0) buffer += `\x1b[${rowDelta}B`;
-			else if (rowDelta < 0) buffer += `\x1b[${-rowDelta}A`;
+			if (overlayInPlaceRewrite) {
+				// The cursor tracker can be stale after overlay-only frames. A large
+				// CUU clamps at the viewport top without using absolute cursor home,
+				// so the following full-window rewrite cannot overflow the bottom.
+				if (height > 1) buffer += `\x1b[${height - 1}A`;
+			} else {
+				const rowDelta = firstChanged - currentScreenRow;
+				if (rowDelta > 0) buffer += `\x1b[${rowDelta}B`;
+				else if (rowDelta < 0) buffer += `\x1b[${-rowDelta}A`;
+			}
 			buffer += "\r";
 			// DECCARA-optimize the contiguous rewritten range (visible rows
 			// only; rectangles are absolute screen rows).
@@ -3720,10 +3861,11 @@ export class TUI extends Container {
 				buffer += `\x1b[${lastChanged - contentBottomScreenRow}A`;
 				cursorFromRow = contentBottomRow;
 			}
-			const cursorControl = this.#cursorControlSequence(cursorPos, frame.length, cursorFromRow);
+			const cursorControl = this.#cursorControlSequence(cursorPos, cursorTrackingLineCount, cursorFromRow);
 			buffer += cursorControl.seq;
 			buffer += this.#paintEndSequence;
 			this.terminal.write(buffer);
+			this.#windowTopRow = windowTop;
 			this.#commit(frame, window, width, height, cursorControl);
 			return;
 		}
@@ -3749,7 +3891,7 @@ export class TUI extends Container {
 		}
 		const parkUp = height - 1 - (contentBottomRow - windowTop);
 		if (parkUp > 0) buffer += `\x1b[${parkUp}A`;
-		const cursorControl = this.#cursorControlSequence(cursorPos, frame.length, contentBottomRow);
+		const cursorControl = this.#cursorControlSequence(cursorPos, cursorTrackingLineCount, contentBottomRow);
 		buffer += cursorControl.seq;
 		buffer += this.#paintEndSequence;
 		this.terminal.write(buffer);
