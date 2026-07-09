@@ -102,6 +102,24 @@ describe("AgentSession.clearSessionContext", () => {
 		expect(transcriptRaw).toContain("did the first task");
 	});
 
+	it("drops active checkpoint runtime state alongside the cleared conversation", async () => {
+		const active = await createSession();
+		seedConversation(active);
+		// A checkpoint created but not yet rewound: its tool result is dropped with
+		// the conversation, so the checkpoint runtime state must be cleared too —
+		// otherwise the next turn forces a rewind onto the pre-clear transcript.
+		active.setCheckpointState({
+			checkpointMessageCount: active.messages.length,
+			checkpointEntryId: null,
+			startedAt: new Date().toISOString(),
+		});
+		expect(active.getCheckpointState()).toBeDefined();
+
+		await active.clearSessionContext();
+
+		expect(active.getCheckpointState()).toBeUndefined();
+	});
+
 	it("is a no-op that returns undefined while a response is streaming", async () => {
 		const active = await createSession();
 		seedConversation(active);

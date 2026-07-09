@@ -5871,11 +5871,31 @@ export class AgentSession {
 		if (this.isStreaming) return undefined;
 		const droppedCount = this.agent.state.messages.length;
 
+		// Tear down the same per-turn runtime state that newSession() resets across
+		// a conversation boundary, so work scheduled from the pre-clear turn cannot
+		// re-enter the cleared context:
+		//   - bump #promptGeneration + drain post-prompt tasks so an already-queued
+		//     post-prompt continuation (recovery can be scheduled after agent_end
+		//     while isStreaming is false) sees a stale generation and skips
+		//     (mirrors abort()).
+		//   - cancel this agent's async bash/task jobs so their completions can't
+		//     re-deliver stale tool output into the cleared conversation
+		//     (mirrors newSession()'s #cancelOwnAsyncJobs()).
+		this.#promptGeneration++;
+		await this.#cancelPostPromptTasks();
+		this.#cancelOwnAsyncJobs();
+
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
 		this.agent.reset();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+
+		// Drop checkpoint/rewind runtime state alongside the messages that carried
+		// it: the checkpoint tool result is gone from agent.state, so an intact
+		// #checkpointState would otherwise force a rewind onto the pre-clear
+		// transcript on the next turn (mirrors newSession()).
+		this.#clearCheckpointRuntimeState();
 
 		// Rotate provider-side session state so a provider that keeps conversation
 		// history server-side starts a brand-new exchange rather than resuming the
@@ -5886,6 +5906,14 @@ export class AgentSession {
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
 		this.agent.appendOnlyContext?.invalidateForModelChange();
+
+		// Re-arm the approved-plan reference: clearing dropped the plan-approved
+		// prompt/reference from agent.state, so mark it unsent (preserving the
+		// path — the plan file on disk is still the active plan) to let
+		// #buildPlanReferenceMessage re-read and re-inject it on the next turn.
+		// Mirrors the sent-flag reset newSession() and compaction perform after a
+		// history rewrite (issue #1246).
+		this.#planReferenceSent = false;
 
 		// Re-prime the advisor across the conversation boundary and undo any memory
 		// promotion so the next turn rebuilds from the base system prompt.
