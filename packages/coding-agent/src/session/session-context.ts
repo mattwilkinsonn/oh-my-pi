@@ -256,6 +256,11 @@ export function buildSessionContext(
 
 	const injectedTtsrRules = Array.from(injectedTtsrRulesSet);
 
+	// Index on the path of the latest `/clear` boundary, or -1 when none. The
+	// collapsed live transcript starts emission after it (see the emission
+	// branch below); the full-history export/resume path ignores it.
+	const clearBoundaryIdx = path.reduce((latest, entry, i) => (entry.type === "clear_boundary" ? i : latest), -1);
+
 	// Build messages and collect corresponding entries
 	// When there's a compaction, we need to:
 	// 1. Emit summary first (entry = compaction)
@@ -348,6 +353,24 @@ export function buildSessionContext(
 			} else {
 				appendMessage(entry);
 			}
+		}
+	} else if (
+		options?.transcript &&
+		options.collapseCompactedHistory &&
+		clearBoundaryIdx >= 0 &&
+		clearBoundaryIdx > (compaction ? path.findIndex(e => e.type === "compaction" && e.id === compaction.id) : -1)
+	) {
+		// Live surface only: a `/clear` boundary durably hides everything before
+		// it from the collapsed transcript, so a rebuild (theme change, focus
+		// attach, /shake, resume) does not resurrect the pre-clear conversation
+		// the model context already dropped. The full history stays on disk and
+		// the plain `transcript:true` export/resume branch above walks it
+		// unchanged. When a compaction and a clear boundary interact, the later
+		// one on the path wins: a boundary after the latest compaction elides
+		// that compaction (and its kept tail) too, so only genuinely post-clear
+		// entries render.
+		for (let i = clearBoundaryIdx + 1; i < path.length; i++) {
+			appendMessage(path[i]);
 		}
 	} else if (compaction) {
 		const providerPayload: ProviderPayload | undefined = (() => {

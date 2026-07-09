@@ -5920,6 +5920,14 @@ export class AgentSession {
 		this.#resetAdvisorSessionState();
 		await this.#resetMemoryContextForNewTranscript();
 
+		// Record a durable clear boundary on the persisted branch. The live TUI
+		// transcript (collapseCompactedHistory) starts emission after the latest
+		// boundary, so a rebuild across a `/clear` (theme change, focus attach,
+		// /shake, resume) does not resurrect the pre-clear conversation the model
+		// context already dropped. The on-disk record and the plain
+		// `transcript:true` export/resume path keep the full pre-clear history.
+		this.sessionManager.appendClearBoundary();
+
 		return { droppedCount };
 	}
 

@@ -9,6 +9,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { parseSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 
@@ -134,5 +136,154 @@ describe("AgentSession.clearSessionContext", () => {
 
 		expect(result).toBeUndefined();
 		expect(active.messages).toHaveLength(liveBefore);
+	});
+});
+
+describe("clear boundary durable display", () => {
+	let tempDir: string;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+
+	beforeEach(() => {
+		tempDir = path.join(os.tmpdir(), `pi-clear-boundary-test-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		await session?.dispose();
+		authStorage?.close();
+		await fs.promises
+			.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+			.catch(() => undefined);
+		vi.restoreAllMocks();
+	});
+
+	async function createSession(): Promise<AgentSession> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["unused"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		return session;
+	}
+
+	function seedTurn(active: AgentSession, userText: string, assistantText: string): void {
+		active.sessionManager.appendMessage({ role: "user", content: userText, timestamp: Date.now() });
+		active.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: assistantText }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+	}
+
+	function transcriptTexts(active: AgentSession, collapse: boolean): string[] {
+		const sm = active.sessionManager;
+		const ctx = buildSessionContext(sm.getBranch(), undefined, undefined, {
+			transcript: true,
+			collapseCompactedHistory: collapse,
+		});
+		const texts: string[] = [];
+		for (const message of ctx.messages) {
+			if (!("content" in message)) continue;
+			const content = message.content;
+			if (typeof content === "string") {
+				texts.push(content);
+			} else {
+				for (const block of content) {
+					if (block.type === "text") texts.push(block.text);
+				}
+			}
+		}
+		return texts;
+	}
+
+	it("hides pre-clear messages from the collapsed live transcript after clearSessionContext()", async () => {
+		const active = await createSession();
+		seedTurn(active, "pre-clear question", "pre-clear answer");
+		await active.clearSessionContext();
+		seedTurn(active, "post-clear question", "post-clear answer");
+
+		const live = transcriptTexts(active, true).join("\n");
+		expect(live).toContain("post-clear question");
+		expect(live).toContain("post-clear answer");
+		expect(live).not.toContain("pre-clear question");
+		expect(live).not.toContain("pre-clear answer");
+	});
+
+	it("keeps the full pre-clear history in the non-collapsed export/resume transcript", async () => {
+		const active = await createSession();
+		seedTurn(active, "pre-clear question", "pre-clear answer");
+		await active.clearSessionContext();
+		seedTurn(active, "post-clear question", "post-clear answer");
+
+		const full = transcriptTexts(active, false).join("\n");
+		expect(full).toContain("pre-clear question");
+		expect(full).toContain("pre-clear answer");
+		expect(full).toContain("post-clear question");
+		expect(full).toContain("post-clear answer");
+	});
+
+	it("persists the clear_boundary entry so it round-trips through save/load", async () => {
+		const active = await createSession();
+		seedTurn(active, "pre-clear question", "pre-clear answer");
+		await active.clearSessionContext();
+		seedTurn(active, "post-clear question", "post-clear answer");
+		await active.sessionManager.flush();
+
+		const file = active.sessionFile;
+		expect(file).toBeDefined();
+		const raw = fs.readFileSync(file!, "utf8");
+		const parsed = parseSessionEntries(raw);
+		const boundaries = parsed.filter(entry => entry.type === "clear_boundary");
+		expect(boundaries).toHaveLength(1);
+
+		// Reload from disk and confirm the boundary still gates the collapsed
+		// live transcript while the full history survives.
+		const reloaded = await SessionManager.open(file!, tempDir);
+		try {
+			const branch = reloaded.getBranch();
+			expect(branch.some(entry => entry.type === "clear_boundary")).toBe(true);
+			const liveCtx = buildSessionContext(branch, undefined, undefined, {
+				transcript: true,
+				collapseCompactedHistory: true,
+			});
+			const liveTexts: string[] = [];
+			for (const message of liveCtx.messages) {
+				if (!("content" in message)) continue;
+				const content = message.content;
+				if (typeof content === "string") {
+					liveTexts.push(content);
+				} else {
+					for (const block of content) {
+						if (block.type === "text") liveTexts.push(block.text);
+					}
+				}
+			}
+			const liveText = liveTexts.join("\n");
+			expect(liveText).toContain("post-clear question");
+			expect(liveText).not.toContain("pre-clear question");
+		} finally {
+			await reloaded.close();
+		}
 	});
 });

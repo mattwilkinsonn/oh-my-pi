@@ -32,6 +32,7 @@ import {
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
+	type ClearBoundaryEntry,
 	type CompactionEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -1488,6 +1489,17 @@ export class SessionManager {
 
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
 		const entry: ModeChangeEntry = { type: "mode_change", ...this.#freshEntryFields(), mode, data };
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Append a clear boundary marker recorded by `/clear`. Durable display
+	 * boundary: the collapsed live transcript starts after the latest one, while
+	 * the full history stays on disk (export/resume walk it unchanged).
+	 */
+	appendClearBoundary(): string {
+		const entry: ClearBoundaryEntry = { type: "clear_boundary", ...this.#freshEntryFields() };
 		this.#recordEntry(entry);
 		return entry.id;
 	}

@@ -101,6 +101,18 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 }
 
 /**
+ * Pure marker entry recorded by `/clear` (clearSessionContext). It carries no
+ * payload — its presence on the branch is a durable boundary the live TUI
+ * transcript starts emission after, so a rebuild (theme change, focus attach,
+ * /shake, resume) does not resurrect the pre-clear conversation. The on-disk
+ * record and the plain `transcript:true` export/resume path keep the full
+ * pre-clear history; only the collapsed live surface honors the boundary.
+ */
+export interface ClearBoundaryEntry extends SessionEntryBase {
+	type: "clear_boundary";
+}
+
+/**
  * Custom entry for extensions to store extension-specific data in the session.
  * Use customType to identify your extension's entries.
  *
@@ -135,6 +147,7 @@ export interface TitleChangeEntry extends SessionEntryBase {
 declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 	interface CustomCompactionSessionEntries {
 		titleChange: TitleChangeEntry;
+		clearBoundary: ClearBoundaryEntry;
 	}
 }
 
@@ -215,7 +228,8 @@ export type SessionEntry =
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
 	| SessionInitEntry
-	| ModeChangeEntry;
+	| ModeChangeEntry
+	| ClearBoundaryEntry;
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
