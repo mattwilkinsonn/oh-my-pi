@@ -16,16 +16,38 @@ export async function atomicWriteThroughSymlink(targetPath: string, data: string
 	let realPath = targetPath;
 	try {
 		if ((await fs.lstat(targetPath)).isSymbolicLink()) {
-			realPath = await fs.realpath(targetPath);
+			try {
+				realPath = await fs.realpath(targetPath);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+				// Dangling link (referent not created yet — e.g. a first-run config.yml
+				// symlink into a dotfiles checkout). Resolve the link's referent relative
+				// to the link dir and write there, so the link itself is preserved rather
+				// than clobbered into a regular file.
+				const referent = await fs.readlink(targetPath);
+				realPath = path.resolve(path.dirname(targetPath), referent);
+			}
 		}
 	} catch (error) {
-		// Nothing at the path (or a dangling link) — write at the path itself.
+		// Nothing at the path — write at the path itself.
+		if (!isEnoent(error)) throw error;
+	}
+
+	// Preserve the real target's permissions: Bun.write creates the temp with the
+	// default mode (0644), and the rename would otherwise widen a tightened
+	// (e.g. 0600) config that can hold secrets. Stat before writing; apply the
+	// mode to the temp before it takes the target's place.
+	let mode: number | undefined;
+	try {
+		mode = (await fs.stat(realPath)).mode;
+	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
 
 	const tmpPath = path.join(path.dirname(realPath), `.${path.basename(realPath)}.${process.pid}.${Date.now()}.tmp`);
 	try {
 		await Bun.write(tmpPath, data);
+		if (mode !== undefined) await fs.chmod(tmpPath, mode & 0o777);
 		await fs.rename(tmpPath, realPath);
 	} catch (error) {
 		await fs.rm(tmpPath, { force: true }).catch(() => {});

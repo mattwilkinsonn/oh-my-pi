@@ -65,4 +65,56 @@ describe("atomicWriteThroughSymlink", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("preserves the real target's 0600 permissions across the rename", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-atomic-write-"));
+		try {
+			const p = path.join(dir, "config.yml");
+			await fs.writeFile(p, "secret: old\n");
+			await fs.chmod(p, 0o600);
+
+			await atomicWriteThroughSymlink(p, "secret: new\n");
+
+			expect(await fs.readFile(p, "utf8")).toBe("secret: new\n");
+			expect((await fs.stat(p)).mode & 0o777).toBe(0o600);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves permissions of the symlink's real target, keeping the link", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-atomic-write-"));
+		try {
+			const real = path.join(dir, "config.yml");
+			await fs.writeFile(real, "secret: old\n");
+			await fs.chmod(real, 0o600);
+			const link = path.join(dir, "linked.yml");
+			await fs.symlink(real, link);
+
+			await atomicWriteThroughSymlink(link, "secret: new\n");
+
+			expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+			expect(await fs.readFile(real, "utf8")).toBe("secret: new\n");
+			expect((await fs.stat(real)).mode & 0o777).toBe(0o600);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("writes through a dangling symlink to its referent, preserving the link", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-atomic-write-"));
+		try {
+			const referent = path.join(dir, "config.yml");
+			const link = path.join(dir, "linked.yml");
+			// Link points at a referent that does not exist yet (first-run dotfiles case).
+			await fs.symlink(referent, link);
+
+			await atomicWriteThroughSymlink(link, "fresh\n");
+
+			expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+			expect(await fs.readFile(referent, "utf8")).toBe("fresh\n");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 });
