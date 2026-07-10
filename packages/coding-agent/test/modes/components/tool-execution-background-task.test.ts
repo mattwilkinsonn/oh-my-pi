@@ -93,7 +93,7 @@ describe("ToolExecutionComponent detached task freeze", () => {
 		const component = new ToolExecutionComponent(
 			"task",
 			{ agent: "explore", id: "Anna", description: "scout auth", assignment: "investigate the auth flow" },
-			{ liveRegion: { isBlockInLiveRegion: () => live() } },
+			{ liveRegion: { isBlockInLiveRegion: () => live(), isBlockUncommitted: () => true } },
 			undefined,
 			ui,
 		);
