@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
@@ -73,7 +74,10 @@ describe("AgentSession.clearSessionContext", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function createSession(): Promise<AgentSession> {
+	async function createSession(overrides?: {
+		asyncJobManager?: AsyncJobManager;
+		agentId?: string;
+	}): Promise<AgentSession> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["unused"] }) });
 		const agent = new Agent({
@@ -86,7 +90,14 @@ describe("AgentSession.clearSessionContext", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			asyncJobManager: overrides?.asyncJobManager,
+			agentId: overrides?.agentId,
+		});
 		return session;
 	}
 
@@ -290,6 +301,37 @@ describe("AgentSession.clearSessionContext", () => {
 			outputBytes: 0,
 		});
 		await inFlight;
+	});
+
+	it("cancels this agent's async jobs so their output can't re-enter the cleared context (fix #2)", async () => {
+		const jobManager = new AsyncJobManager({ onJobComplete: () => {} });
+		const agentId = "clear-test-agent";
+		const active = await createSession({ asyncJobManager: jobManager, agentId });
+		seedConversation(active);
+
+		// A long-running owned background job: run() awaits its abort signal, so it
+		// stays in the running set until something cancels it. This is the seam
+		// roboomp/Codex flagged — without #cancelOwnAsyncJobs() in the clear
+		// boundary, its completion would deliver stale tool output back into the
+		// freshly cleared conversation.
+		const jobId = jobManager.register(
+			"bash",
+			"long job",
+			({ signal }) =>
+				new Promise<string>(resolve => {
+					signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+				}),
+			{ ownerId: agentId },
+		);
+		expect(jobManager.getRunningJobs({ ownerId: agentId }).some(job => job.id === jobId)).toBe(true);
+
+		await active.clearSessionContext();
+
+		// The clear boundary cancelled the owned job (reverting fix #2 — dropping
+		// #cancelOwnAsyncJobs() from clearSessionContext — leaves it running here).
+		expect(jobManager.getRunningJobs({ ownerId: agentId }).some(job => job.id === jobId)).toBe(false);
+
+		await jobManager.dispose({ timeoutMs: 1_000 });
 	});
 });
 
