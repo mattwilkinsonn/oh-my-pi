@@ -232,4 +232,29 @@ describe("AgentSession compact tool onTurnEnd wiring", () => {
 			expect(compactSpy).toHaveBeenCalledTimes(1);
 		}
 	});
+
+	it("does not re-fire a consumed compact request on a later prompt's settle", async () => {
+		// Cross-prompt boundary. Prompt 1 requests compaction; #applyRequestedCompaction
+		// consumes it at that settle. But the compact toolResult survives into the
+		// retained window (the spied compact() does not rewrite messages), so it is
+		// still present in `messages` when prompt 2 settles with NO tool call of its
+		// own. Without a consumed-tool-call-id guard, the backward scan finds the SAME
+		// old compact result again and re-fires compaction → 2 calls. Exactly-once
+		// across BOTH prompts proves the request is honored per-turn, not re-applied.
+		const { session } = await createHarness([
+			{
+				content: [{ type: "toolCall", id: "call_compact", name: "compact", arguments: {} }],
+				stopReason: "toolUse",
+			},
+			{ content: ["DONE"], stopReason: "stop" },
+			{ content: ["DONE"], stopReason: "stop" },
+		]);
+
+		const compactSpy = vi.spyOn(session, "compact").mockResolvedValue(fakeCompaction());
+
+		await session.prompt("do the thing then compact");
+		await session.prompt("no compact this turn, just answer");
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+	});
 });
