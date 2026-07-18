@@ -573,6 +573,12 @@ onBeforeRefresh?: (scope: RefreshScope) => void | Promise<void>;
 // refused while #restarting is distinguishable from a successful no-op
 refused?: "restarting";
 
+// tools/refresh.ts — summarizeRefresh() renders the refusal instead of
+// collapsing it into "nothing to reload"; RefreshTool.execute (refresh.ts:87)
+// and the /refresh command (builtin-registry.ts:1469) both route through it and
+// inherit the message with no branch of their own
+if (result.refused) return `Refresh skipped (${scope}): restart in progress.`;
+
 // agent-session.ts — refresh() chains onto the tail, delegates to #doRefresh;
 // onBeforeRefresh is the first statement inside #doRefresh (the critical section)
 if (this.#onBeforeRefresh) await this.#onBeforeRefresh(scope);
@@ -610,6 +616,10 @@ Test cycle (Tester agent, red → green):
 - restart refusal: while `#restarting` is set, `refresh()` returns
   `{ refused: "restarting" }` without chaining onto `#refreshTail` or re-scanning
   (assert no `onBeforeRefresh` call, no surface swap, and the marker is present).
+- refused marker renders, not "nothing to reload": `summarizeRefresh` on a
+  `{ refused: "restarting" }` result returns "Refresh skipped (<scope>): restart
+  in progress." (assert the exact string, and that `RefreshTool.execute` /
+  `/refresh` surface it — not the empty-`RefreshResult` no-op summary).
 
 ### Task 3 — SDK wiring + docs
 
@@ -693,8 +703,11 @@ Two mechanisms are wrong; the third is the contract.
   to. `requestRestart()` still rejects, but who receives it splits by path: on
   the direct SDK path the host `await`s the call and owns re-attach/recovery
   (step 7); on the model path the continuation is untracked with no awaiting
-  caller, so it attaches `.catch(err => logger.error(...))` (OMP's fire-and-forget
-  pattern, `agent-session.ts:2100`/`:4318`) — the failure is operator-visible via
+  caller, so it attaches `.catch(err => logger.error(...))`, following OMP's
+  fire-and-forget catch+log pattern — the IRC wake at `agent-session.ts:2100`
+  (`void this.agent.prompt(...).catch(logger.warn)`), explicitly not the empty
+  `.catch(() => {})` swallow at `#trackPostPromptTask` (`:4318`), which would
+  re-hide the failure this catch exists to surface. The failure is operator-visible via
   the log, and recovery is via the durable session file flushed at step 5, since
   dispose has closed the transcript. The `execute()` ack means
   "scheduled", not "restarted". `RefreshTool` is NOT a valid template —
@@ -749,7 +762,8 @@ Test cycle (Tester agent, red → green):
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
       propagate-on-throw + lock-release, no-op unset, acquirer early-returns
-      `{ refused: "restarting" }` while `#restarting`; tests)
+      `{ refused: "restarting" }` while `#restarting`, `summarizeRefresh` renders
+      that marker so `RefreshTool`/`/refresh` report the refusal; tests)
 - [ ] Task 3 — SDK wiring through `createAgentSession` + host-recipe docs
       (integration tests)
 - [ ] Task 4 — model-callable `restart` tool (`approval: "exec"`, untracked
@@ -810,9 +824,14 @@ tool batch, not against host-driven or `/refresh` calls.
 
 A refresh refused because a restart is in progress returns
 `{ refused: "restarting" }` (a new `RefreshResult` marker) rather than an empty
-result, so a caller (`RefreshTool` / `/refresh`) can tell a refused refresh from
-a successful no-op — the same anti-silent-lie stance as the hook-throw error
-semantics above.
+result. Today every caller funnels through `summarizeRefresh` (`tools/refresh.ts:36`),
+which reads only the populated-surface counts, so it renders an empty result as
+"Refreshed (all): nothing to reload." — reporting the refusal *as* a successful
+no-op. Task 2 therefore gives `summarizeRefresh` a leading `refused` branch
+("Refresh skipped (<scope>): restart in progress."); `RefreshTool` (`refresh.ts:87`)
+and `/refresh` (`builtin-registry.ts:1469`) both route through it and inherit the
+message. So a caller can tell a refused refresh from a successful no-op — the same
+anti-silent-lie stance as the hook-throw error semantics above.
 
 ### (e) Restart latch — `requestRestart()` latches, not just waits
 
