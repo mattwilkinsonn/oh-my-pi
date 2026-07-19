@@ -183,16 +183,25 @@ type RequestRestartResult =
    and the lock-free append writer (`session-storage.ts`) would leave two writers
    on one file. Dispose flips ownership of both cleanly before the host re-creates.
 
-7. Return `{ ok: true }`. A throwing callback rejects the `requestRestart()`
-   call — the host's own hook failed; OMP must not swallow it. Who receives that
-   rejection splits by path (direct host `await` vs. the model tool's untracked
-   catch-and-log) — see decision (a) and Task 4.
+7. Return `{ ok: true }` once the callback resolves. Failures split on whether
+   `dispose()` (step 6) has begun — detected by `#disposeCall` being set. A
+   **pre-dispose failure** (`waitForIdle()`, the `flush()`/`ensureOnDisk()`
+   barrier, or the `#refreshTail` drain throwing before dispose) is *recoverable*:
+   the session is still alive, so `requestRestart()` drops the `#restarting` latch
+   and clears `#restartCall` before rethrowing, and the host may retry a fresh
+   restart (decision (h)). A **post-dispose failure** — the host callback throwing
+   after dispose — is terminal; OMP must not swallow it, so the rejection
+   propagates, and who receives it splits by path (direct host `await` vs. the
+   model tool's untracked catch-and-log) — see decision (a) and Task 4.
 
-**Re-entrancy.** `requestRestart()` coalesces onto a single shared
-`#restartCall` promise: a second call while one is in flight returns the same
-promise, mirroring `dispose()`'s `#disposeCall` (`agent-session.ts:5861-5865`).
-The host callback fires exactly once per restart even under concurrent or
-repeated calls.
+**Re-entrancy.** `requestRestart()` coalesces an in-flight restart onto a single
+shared `#restartCall` promise: a second call while one is in flight returns the
+same promise, so the host callback fires exactly once per restart even under
+concurrent or repeated calls. The coalescing is *not* symmetric with `dispose()`'s
+terminal `#disposeCall` cache (`agent-session.ts:5861-5865`), though: dispose is
+one-way, so caching its settled promise forever is correct, whereas a restart that
+fails in its pre-dispose window is recoverable and must *not* be cached — see
+decision (h).
 
 **Latch semantics.** `waitForIdle()` (`agent-session.ts:6086-6089`) is a
 *wait*, not a *latch* — after it resolves, an IRC wake (`#promptIrcRecords`,
@@ -479,13 +488,17 @@ Add the option to `CreateAgentSessionOptions` (next to `onFirstChatDispatch`,
 `sdk.ts:574`) and to `AgentSessionConfig` (`agent-session.ts:722`); thread it
 through the `new AgentSession({ ... })` construction site (`sdk.ts:2863`).
 Implement `requestRestart()` on `AgentSession` with the sequence from the
-Approach: coalescing re-entrancy guard (shared `#restartCall`) → unbound guard →
-no-session-file guard → busy guard (`hasQueuedMessages()`) → set `#restarting`
-latch (refuse new turns *and* new refreshes, pause async-job delivery) →
-`waitForIdle()` → capture
-durable `getSessionId()` + `sessionFile` → `flush()` + `ensureOnDisk()` →
-`await #refreshTail` (drain in-flight refresh; Task 2's mutex) → `dispose()` →
-`await` callback → `{ ok: true }`.
+Approach: return the in-flight `#restartCall` if one exists → unbound guard →
+no-session-file guard → busy guard (`hasQueuedMessages()`) — these return
+`{ ok: false }` without latching or caching → set `#restarting` latch (refuse new
+turns *and* new refreshes, pause async-job delivery) and cache the committed
+attempt on `#restartCall` → `waitForIdle()` → capture durable `getSessionId()` +
+`sessionFile` → `flush()` + `ensureOnDisk()` → `await #refreshTail` (drain
+in-flight refresh; Task 2's mutex) → `dispose()` → `await` callback → `{ ok: true }`.
+Wrap the latch-and-fallible-ops region: a throw before `dispose()` begins (detected
+via `#disposeCall` unset) clears `#restarting` and `#restartCall` then rethrows, so
+the session resumes and the host can retry; a throw at or after `dispose()` stays
+terminal (decision (h)).
 
 Interfaces:
 
@@ -545,6 +558,12 @@ Test cycle (Tester agent, red → green):
   dispose, AND a `refresh()` *started* after the `#restarting` latch is set
   early-returns without re-scanning — assert restart does not dispose until the
   in-flight refresh settles, and the post-latch refresh performs no swap.
+- pre-dispose failure recovery (decision (h)): force a pre-dispose step to reject
+  (e.g. stub `ensureOnDisk()` to throw) and assert `requestRestart()` rejects, the
+  `#restarting` latch is dropped (a subsequent prompt starts a turn and `refresh()`
+  is no longer refused), `#restartCall` is cleared, and a second `requestRestart()`
+  runs the full sequence to `{ ok: true }`; separately, a callback throw *after*
+  dispose leaves the session terminal (no unlatch, a retry does not re-dispose).
 
 ### Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into `refresh()`
 
@@ -759,7 +778,8 @@ Test cycle (Tester agent, red → green):
 - [ ] Task 1 — `onRestartRequested` option + `AgentSession.requestRestart()`
       (re-entrancy + busy guards, latch that also refuses new refreshes, capture,
       durability barrier, drain `#refreshTail` before dispose, dispose, awaited
-      callback; tests) — the drain/refuse depends on Task 2's `#refreshTail`
+      callback, pre-dispose failure unlatches while post-dispose stays terminal
+      (decision (h)); tests) — the drain/refuse depends on Task 2's `#refreshTail`
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
       propagate-on-throw + lock-release, no-op unset, acquirer early-returns
@@ -859,6 +879,50 @@ guarantee external idleness. Rejected: snapshot + documented "call only when
 externally idle" precondition — cheap, but an always-on multi-tenant host cannot
 reliably honor it, so it would drop transcript tails and parked input in exactly
 this record's target deployment.
+
+### (h) Pre-dispose failure unlatches; post-dispose failure is terminal
+
+The re-entrancy guard caches `#restartCall` the way `dispose()` caches
+`#disposeCall` (decision (e), `agent-session.ts:5861-5865`), but the two failure
+modes are not symmetric. `dispose()` is one-way, so caching its settled promise
+forever — resolved or rejected — is correct. `requestRestart()` sets the
+`#restarting` latch (step 3) and then runs fallible work while the session is
+*still alive*: `waitForIdle()`, the `flush()`/`ensureOnDisk()` durability barrier
+(step 5), and the `#refreshTail` drain (step 6, before `dispose()`). If any of
+these throws, a naive shared-promise cache strands the session — `#restarting`
+stays set (new turns reject, `refresh()` returns `{ refused: "restarting" }`) and
+`#restartCall` holds the rejection, so every later `requestRestart()` replays the
+stale error: a live but permanently wedged session. A transient `ENOSPC` on
+`flush()` would trigger exactly this on the always-on Compass hosts this record
+serves.
+
+Chosen: a pre-dispose failure is *recoverable*. The latch-and-fallible-ops region
+is wrapped; on a throw with `#disposeCall` still unset (dispose has not begun) it
+clears both `#restarting` and `#restartCall`, then rethrows. The session resumes
+normal turns and refreshes, and the host — which received the rejection — may call
+`requestRestart()` again. Only a failure at or after `dispose()` stays terminal:
+the callback throw of step 7, the old session already gone, with nothing to
+unlatch and no retry that may re-dispose.
+
+```ts
+this.#restarting = true;                          // latch (step 3), before any await
+this.#restartCall = this.#doRequestRestart();     // coalesce the committed attempt
+// inside #doRequestRestart, wrapping waitForIdle → barrier → drain → dispose → callback:
+} catch (err) {
+    if (!this.#disposeCall) {           // threw before dispose began — recoverable
+        this.#restarting = false;
+        this.#restartCall = undefined;  // drop the cache so the host can retry
+    }
+    throw err;                          // post-dispose (callback) failure stays terminal
+}
+```
+
+Rejected: hold `#restarting` after a pre-dispose failure and add a separate
+unlatch affordance — a transient disk hiccup during a hygiene-recycle would park a
+live always-on agent until manual intervention, against the
+durability-for-always-on goal; terminal-bricking behind a documented
+non-guarantee is worse still. Surfaced as Greptile P1 on the round-7 review;
+Matt's call.
 
 ### Refresh callback shape: disk pre-hook, not an in-memory provider
 
