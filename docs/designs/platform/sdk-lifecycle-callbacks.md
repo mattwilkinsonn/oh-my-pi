@@ -352,8 +352,15 @@ async refresh(scope: RefreshScope = "all"): Promise<RefreshResult> {
     // restart in progress: refuse a new refresh so nothing chains on behind the
     // one restart drains, and report the refusal (not a silent no-op).
     if (this.#restarting) return { refused: "restarting" };
-    // serialize: chain onto the tail so overlapping callers run in order
-    const run = this.#refreshTail.then(() => this.#doRefresh(scope));
+    // serialize: chain onto the tail so overlapping callers run in order, and
+    // re-check the latch when this callback begins — a refresh queued behind an
+    // in-flight one before the latch must refuse, not run during restart (k).
+    const run = this.#refreshTail.then(() => {
+        if (this.#restarting) return { refused: "restarting" };
+        const active = this.#doRefresh(scope);
+        this.#activeRefresh = active; // raw run the restart drains (j), never the tail
+        return active;
+    });
     this.#refreshTail = run.then(() => {}, () => {}); // never reject the tail
     return run;
 }
@@ -408,8 +415,11 @@ refresh's `applyReloadedSkills` fan-out and `onBeforeRefresh` disk writes comple
 while only the old session is registered — they cannot clobber the freshly-scanned
 `#skills`/on-disk config the replacement re-reads for itself (Task 1 step 6,
 decision (e)). Two subtleties: (1) the restart latch refuses a *new* refresh (the
-acquirer early-returns `{ refused: "restarting" }` while `#restarting`), so only
-the one already in its critical section drains. (2) Restart drains the refresh's
+acquirer early-returns `{ refused: "restarting" }` while `#restarting`) *and* a
+refresh queued behind an in-flight one re-checks the latch when its chained
+callback begins and refuses the same way (decision (k)), so only the one already
+in its critical section when the latch trips drains — nothing queued runs during
+restart. (2) Restart drains the refresh's
 *actual* settlement — a handle to the running `#doRefresh` promise, **not** the
 `#refreshTail` tail, which is deliberately failure-swallowing
 (`run.then(() => {}, () => {})`) so overlapping callers never reject each other.
@@ -622,10 +632,13 @@ make the awaited `onBeforeRefresh` call the first statement of `#doRefresh`,
 before the `doRoster`/`doSettings`/`doMcp` scope flags are computed
 (`agent-session.ts:6912-6915` today). The mutex spans the hook, every re-scan,
 and every surface swap, so overlapping refreshes cannot interleave (see
-Approach → Concurrency). The acquirer also exposes a handle to the in-flight
-`#doRefresh` run (`#activeRefresh`) so `requestRestart()` can drain the refresh's
-*real* settlement — the `#refreshTail` tail is failure-swallowing and would hide
-a failed pull from the restart (decision (j)).
+Approach → Concurrency). The acquirer checks `#restarting` at admission *and*
+re-checks it inside the chained tail callback, so a refresh queued behind an
+in-flight one before the latch refuses instead of running during restart
+(decision (k)). It also exposes a handle to the in-flight `#doRefresh` run
+(`#activeRefresh`, assigned inside the callback) so `requestRestart()` can drain
+the refresh's *real* settlement — the `#refreshTail` tail is failure-swallowing
+and would hide a failed pull from the restart (decision (j)).
 
 Interfaces:
 
@@ -653,9 +666,21 @@ refused?: "restarting";
 // inherit the message with no branch of their own
 if (result.refused) return `Refresh skipped (${scope}): restart in progress.`;
 
-// agent-session.ts — refresh() chains onto the tail, delegates to #doRefresh;
-// onBeforeRefresh is the first statement inside #doRefresh (the critical section)
-if (this.#onBeforeRefresh) await this.#onBeforeRefresh(scope);
+// agent-session.ts — refresh() acquirer: admission latch-check, then chain onto
+// the tail with a SECOND latch-check when the chained callback begins, so a
+// refresh queued before the latch refuses instead of running during restart
+// (decision (k)). #activeRefresh is assigned INSIDE the callback to the raw
+// #doRefresh run — never the swallowing tail — so the restart drain observes the
+// real settlement (decision (j)); a refused queued refresh never touches it.
+if (this.#restarting) return { refused: "restarting" };            // admission check
+const run = this.#refreshTail.then(() => {
+    if (this.#restarting) return { refused: "restarting" };        // re-check on turn
+    const active = this.#doRefresh(scope);                         // onBeforeRefresh is
+    this.#activeRefresh = active;                                  //  its first statement
+    return active;
+});
+this.#refreshTail = run.then(() => {}, () => {});                  // never reject the tail
+return run;
 ```
 
 Consumes: `RefreshScope` (`extensibility/reload.ts:32-33`). Produces: a
@@ -701,6 +726,11 @@ Test cycle (Tester agent, red → green):
   recoverable-abort response; this asserts the handle the restart reads. The
   atomic-write requirement is a host-side contract carried by the option
   doc-comment, not OMP-testable here.)
+- queued refresh re-checks the latch (decision (k)): start refresh A (hook blocks
+  on a released gate), admit refresh B chained behind it, then `requestRestart()`;
+  release A's gate. Assert B returns `{ refused: "restarting" }` and its
+  `onBeforeRefresh` never fires (no `#doRefresh` entry after the latch), while the
+  restart drains only A's `#activeRefresh`.
 
 ### Task 3 — SDK wiring + docs
 
@@ -848,7 +878,9 @@ Test cycle (Tester agent, red → green):
 - [ ] Task 2 — `onBeforeRefresh` option + refresh mutex, threaded into
       `AgentSession.refresh()` (serialized critical section, awaited hook,
       propagate-on-throw + lock-release, no-op unset, acquirer early-returns
-      `{ refused: "restarting" }` while `#restarting`, `summarizeRefresh` renders
+      `{ refused: "restarting" }` while `#restarting` at admission and re-checks
+      the latch in the chained callback so a queued refresh refuses too (decision
+      (k)), `summarizeRefresh` renders
       that marker so `RefreshTool`/`/refresh` report the refusal, exposes
       `#activeRefresh` for the restart drain, atomic-write host contract in the
       option doc-comment (decision (j)); tests)
@@ -1058,6 +1090,23 @@ atomicity alone (leaves the drain blind to a non-write failure mid-refresh) and
 drain-observation alone (a non-atomic host could still tear config a *non-restart*
 refresh caller then scans). Surfaced as Greptile P1 on the round-9 review; Matt's
 call.
+
+### (k) Queued refreshes re-check the restart latch, not just new ones
+
+`refresh()` checks `#restarting` at admission then chains onto `#refreshTail`
+(Task 2 acquirer). A refresh admitted *before* the latch but still queued behind
+an in-flight one would otherwise enter `#doRefresh()` when its turn comes —
+*after* restart has latched and begun draining only the in-flight run's
+`#activeRefresh` — pulling config during restart and racing dispose / replacement
+creation. Chosen: the chained tail callback re-checks `#restarting` when it begins
+and returns `{ refused: "restarting" }` instead of running, so a queued refresh
+refuses fast with the same marker the admission check returns and
+`RefreshTool`/`/refresh` already render. Restart still drains only the actual
+in-flight settlement (`#activeRefresh`, decision (j)) — it does not wait on
+arbitrary queued refreshes. Rejected: draining *all* admitted work before dispose
+— it runs those queued pulls during restart (the very race above) and blocks
+dispose on unbounded queued refreshes. Surfaced as a Greptile P1 on re-review;
+Matt's call.
 
 ### Refresh callback shape: disk pre-hook, not an in-memory provider
 
